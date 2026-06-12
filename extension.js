@@ -30,8 +30,8 @@ const SLIDE_OUT_MS = 150;
 // Popular ready-made colour schemes. Each value is a complete foot [colors]
 // block (hex without '#'). The chosen scheme is written to
 // ~/.config/drop-terminal/theme.ini, which foot.ini pulls in via `include=`.
-// Switching a scheme rewrites that file and SIGUSR1s foot to live-reload it,
-// so the running shell session is preserved.
+// foot reads that include= only at startup, so switching a scheme rewrites the
+// file and restarts foot to pick it up (see setTheme for why SIGUSR1 can't).
 const DEFAULT_THEME = 'dracula';
 const THEME_ORDER = ['dracula', 'gruvbox', 'nord', 'catppuccin'];
 const THEMES = {
@@ -376,20 +376,32 @@ export default class DropTermExtension extends Extension {
         this._visible = false;
     }
 
-    // Switch colour scheme: rewrite the included theme file and live-reload a
-    // running foot via SIGUSR1 (foot re-reads its config + includes on USR1),
-    // so the shell session and scrollback survive the change.
+    // Switch colour scheme: rewrite the included theme file, then restart foot.
+    //
+    // foot reads its colours (our include=) ONLY at startup. SIGUSR1 does NOT
+    // re-read the file — per foot(1) it merely re-applies the [colors] section
+    // already loaded in memory, so signalling a running foot keeps the OLD
+    // theme (this was why a switch "had no effect"). The only reliable way to
+    // apply a freshly-written palette is to relaunch foot. Cost: scrollback /
+    // the running session is lost on a theme change. This also drops the old
+    // blind `kill -USR1 <pid>`: under PID reuse during heavy load (e.g. a big
+    // update churning processes) that could signal an unrelated process, whose
+    // default SIGUSR1 action is to terminate — the likely cause of the freeze.
     setTheme(name) {
         if (!THEMES[name])
             return;
         this._writeTheme(name);
         this._indicator?.setActiveTheme(name);
 
-        const pid = this._win?.get_pid?.() ??
-            (this._proc ? Number(this._proc.get_identifier()) : 0);
-        if (pid > 0) {
-            try { GLib.spawn_command_line_async(`kill -USR1 ${pid}`); } catch (_e) {}
-        }
+        // Nothing running yet: the new theme is read on the next spawn.
+        if (!this._win && !this._proc)
+            return;
+
+        // Restart in place, preserving whether the terminal is currently shown.
+        const wasVisible = this._visible;
+        this.killTerminal();
+        this._spawn();
+        this._visible = wasVisible;
     }
 
     // ---- colour-scheme storage -------------------------------------------
@@ -477,7 +489,7 @@ export default class DropTermExtension extends Extension {
         // so confirm now and also on the next change.
         if (this._matches(win)) {
             this._setupWindow(win);
-            this._show();
+            this._revealPerIntent();
             return;
         }
         const id = win.connect('notify::wm-class', () => {
@@ -485,10 +497,20 @@ export default class DropTermExtension extends Extension {
                 win.disconnect(id);
                 if (!this._win) {
                     this._setupWindow(win);
-                    this._show();
+                    this._revealPerIntent();
                 }
             }
         });
+    }
+
+    // A freshly-created foot window honours the current show/hide intent:
+    // visible -> drop it in, hidden (e.g. a theme restart while the terminal
+    // was closed) -> keep it off-screen so nothing flashes on screen.
+    _revealPerIntent() {
+        if (this._visible)
+            this._show();
+        else
+            this._hideInstant();
     }
 
     _matches(win) {
