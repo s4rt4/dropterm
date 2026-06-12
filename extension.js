@@ -27,6 +27,108 @@ const DROP_HEIGHT_RATIO = 0.45;   // fraction of screen height the terminal cove
 const SLIDE_IN_MS = 180;
 const SLIDE_OUT_MS = 150;
 
+// Popular ready-made colour schemes. Each value is a complete foot [colors]
+// block (hex without '#'). The chosen scheme is written to
+// ~/.config/drop-terminal/theme.ini, which foot.ini pulls in via `include=`.
+// Switching a scheme rewrites that file and SIGUSR1s foot to live-reload it,
+// so the running shell session is preserved.
+const DEFAULT_THEME = 'dracula';
+const THEME_ORDER = ['dracula', 'gruvbox', 'nord', 'catppuccin'];
+const THEMES = {
+    dracula: {
+        label: 'Dracula',
+        colors: `[colors]
+foreground=f8f8f2
+background=282a36
+regular0=21222c
+regular1=ff5555
+regular2=50fa7b
+regular3=f1fa8c
+regular4=bd93f9
+regular5=ff79c6
+regular6=8be9fd
+regular7=f8f8f2
+bright0=6272a4
+bright1=ff6e6e
+bright2=69ff94
+bright3=ffffa5
+bright4=d6acff
+bright5=ff92df
+bright6=a4ffff
+bright7=ffffff
+`,
+    },
+    gruvbox: {
+        label: 'Gruvbox Dark',
+        colors: `[colors]
+foreground=ebdbb2
+background=282828
+regular0=282828
+regular1=cc241d
+regular2=98971a
+regular3=d79921
+regular4=458588
+regular5=b16286
+regular6=689d6a
+regular7=a89984
+bright0=928374
+bright1=fb4934
+bright2=b8bb26
+bright3=fabd2f
+bright4=83a598
+bright5=d3869b
+bright6=8ec07c
+bright7=ebdbb2
+`,
+    },
+    nord: {
+        label: 'Nord',
+        colors: `[colors]
+foreground=d8dee9
+background=2e3440
+regular0=3b4252
+regular1=bf616a
+regular2=a3be8c
+regular3=ebcb8b
+regular4=81a1c1
+regular5=b48ead
+regular6=88c0d0
+regular7=e5e9f0
+bright0=4c566a
+bright1=bf616a
+bright2=a3be8c
+bright3=ebcb8b
+bright4=81a1c1
+bright5=b48ead
+bright6=8fbcbb
+bright7=eceff4
+`,
+    },
+    catppuccin: {
+        label: 'Catppuccin Mocha',
+        colors: `[colors]
+foreground=cdd6f4
+background=1e1e2e
+regular0=45475a
+regular1=f38ba8
+regular2=a6e3a1
+regular3=f9e2af
+regular4=89b4fa
+regular5=f5c2e7
+regular6=94e2d5
+regular7=bac2de
+bright0=585b70
+bright1=f38ba8
+bright2=a6e3a1
+bright3=f9e2af
+bright4=89b4fa
+bright5=f5c2e7
+bright6=94e2d5
+bright7=a6adc8
+`,
+    },
+};
+
 const DropTermIndicator = GObject.registerClass(
 class DropTermIndicator extends PanelMenu.Button {
     _init(ext) {
@@ -38,7 +140,18 @@ class DropTermIndicator extends PanelMenu.Button {
             style_class: 'system-status-icon',
         }));
 
-        // Right-click menu: a couple of housekeeping actions.
+        // Right-click menu: colour-scheme picker + housekeeping actions.
+        const themes = new PopupMenu.PopupSubMenuMenuItem('Tema warna');
+        this._themeItems = {};
+        for (const key of THEME_ORDER) {
+            const item = new PopupMenu.PopupMenuItem(THEMES[key].label);
+            item.connect('activate', () => this._ext.setTheme(key));
+            themes.menu.addMenuItem(item);
+            this._themeItems[key] = item;
+        }
+        this.menu.addMenuItem(themes);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         const restart = new PopupMenu.PopupMenuItem('Restart terminal');
         restart.connect('activate', () => this._ext.restartTerminal());
         this.menu.addMenuItem(restart);
@@ -46,6 +159,15 @@ class DropTermIndicator extends PanelMenu.Button {
         const quit = new PopupMenu.PopupMenuItem('Quit terminal');
         quit.connect('activate', () => this._ext.killTerminal());
         this.menu.addMenuItem(quit);
+    }
+
+    // Tick the active scheme in the submenu.
+    setActiveTheme(name) {
+        for (const [key, item] of Object.entries(this._themeItems)) {
+            item.setOrnament(key === name
+                ? PopupMenu.Ornament.CHECK
+                : PopupMenu.Ornament.NONE);
+        }
     }
 
     // Left-click toggles the terminal; right-click opens the menu.
@@ -79,8 +201,13 @@ export default class DropTermExtension extends Extension {
         this._clientPath = null;
         this._endSessionSubId = 0;
 
+        // Make sure the colour-scheme file foot includes exists before we ever
+        // spawn foot, otherwise the include= line errors out on a fresh setup.
+        this._ensureThemeFile();
+
         this._indicator = new DropTermIndicator(this);
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
+        this._indicator.setActiveTheme(this._activeTheme);
 
         // Catch foot's window the moment it is created.
         this._winCreatedId = global.display.connect('window-created',
@@ -247,6 +374,68 @@ export default class DropTermExtension extends Extension {
         this._disconnectWindow();
         this._killFoot();
         this._visible = false;
+    }
+
+    // Switch colour scheme: rewrite the included theme file and live-reload a
+    // running foot via SIGUSR1 (foot re-reads its config + includes on USR1),
+    // so the shell session and scrollback survive the change.
+    setTheme(name) {
+        if (!THEMES[name])
+            return;
+        this._writeTheme(name);
+        this._indicator?.setActiveTheme(name);
+
+        const pid = this._win?.get_pid?.() ??
+            (this._proc ? Number(this._proc.get_identifier()) : 0);
+        if (pid > 0) {
+            try { GLib.spawn_command_line_async(`kill -USR1 ${pid}`); } catch (_e) {}
+        }
+    }
+
+    // ---- colour-scheme storage -------------------------------------------
+
+    _configDir() {
+        return GLib.build_filenamev([GLib.get_user_config_dir(), 'drop-terminal']);
+    }
+
+    _themeFilePath() {
+        return GLib.build_filenamev([this._configDir(), 'theme.ini']);
+    }
+
+    _activeFilePath() {
+        return GLib.build_filenamev([this._configDir(), 'active']);
+    }
+
+    // Remember the last-picked scheme name across restarts (sits next to the
+    // generated theme.ini so a manual deletion resets both together).
+    _loadActiveName() {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(this._activeFilePath());
+            if (ok) {
+                const s = new TextDecoder().decode(bytes).trim();
+                if (THEMES[s])
+                    return s;
+            }
+        } catch (_e) {}
+        return null;
+    }
+
+    _writeTheme(name) {
+        const theme = THEMES[name];
+        if (!theme)
+            return;
+        GLib.mkdir_with_parents(this._configDir(), 0o755);
+        GLib.file_set_contents(this._themeFilePath(), theme.colors);
+        GLib.file_set_contents(this._activeFilePath(), name);
+        this._activeTheme = name;
+    }
+
+    // Guarantee theme.ini exists (foot's include= would error without it).
+    // Honour any previously-picked scheme; fall back to the default.
+    _ensureThemeFile() {
+        this._activeTheme = this._loadActiveName() ?? DEFAULT_THEME;
+        if (!GLib.file_test(this._themeFilePath(), GLib.FileTest.EXISTS))
+            this._writeTheme(this._activeTheme);
     }
 
     // ---- terminal lifecycle ----------------------------------------------
