@@ -1,0 +1,8 @@
+{
+  "uuid": "drop-terminal@sarta.local",
+  "name": "Drop Terminal",
+  "description": "Lightweight dropdown terminal that lives in the top panel. Text is rendered by foot (native Wayland terminal) so output never lags; the GNOME Shell extension only manages window position and the slide animation.",
+  "shell-version": ["49"],
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 2
+}
