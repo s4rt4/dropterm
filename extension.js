@@ -172,6 +172,15 @@ class DropTermIndicator extends PanelMenu.Button {
         const quit = new PopupMenu.PopupMenuItem('Quit terminal');
         quit.connect('activate', () => this._ext.killTerminal());
         this.menu.addMenuItem(quit);
+        this._quitItem = quit;
+
+        // Grey out "Quit terminal" when there's nothing to quit. Recompute each
+        // time the menu opens so it always reflects reality — foot may have
+        // exited on its own (`exit`) or been spawned since the menu last closed.
+        this.menu.connect('open-state-changed', (_menu, isOpen) => {
+            if (isOpen)
+                this._quitItem.setSensitive(this._ext.isRunning());
+        });
     }
 
     // Tick the active scheme in the submenu.
@@ -480,6 +489,13 @@ export default class DropTermExtension extends Extension {
         this._disconnectWindow();
         this._killFoot();
         this._visible = false;
+    }
+
+    // foot alive? True whether it's shown or hidden — either we hold its
+    // Subprocess (spawned by us, window may not have appeared yet) or we've
+    // adopted its window. Used to grey out "Quit" when there's nothing to quit.
+    isRunning() {
+        return !!(this._win || this._proc);
     }
 
     // Switch colour scheme: rewrite the included theme file, then restart foot.
