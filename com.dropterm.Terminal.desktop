@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Drop Terminal
+Comment=Foot-backed dropdown terminal
+Icon=com.dropterm.Terminal
+Exec=foot
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=com.dropterm.Terminal
+NoDisplay=true
