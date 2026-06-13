@@ -198,6 +198,7 @@ export default class DropTermExtension extends Extension {
         this._pinLaterId = 0;
         this._aboveLaterId = 0;
         this._pinBurstIds = [];
+        this._firstShown = false;  // sudah pernah tampil sukses? (lihat _show)
         this._clientPath = null;
         this._endSessionSubId = 0;
 
@@ -281,6 +282,9 @@ export default class DropTermExtension extends Extension {
             }
         }
         this._win = null;
+        // foot mati → spawn berikutnya memunculkan window baru yang lagi-lagi
+        // balapan dgn penempatan-tengah Mutter, jadi pin-burst perlu jalan lagi.
+        this._firstShown = false;
     }
 
     // ---- gnome-session client (logout hook) ------------------------------
@@ -568,6 +572,7 @@ export default class DropTermExtension extends Extension {
             this._win = null;
             this._visible = false;
             this._proc = null;
+            this._firstShown = false;  // window berikutnya butuh pin-burst lagi
         });
         this._winSignals.push([win, unmanagedId]);
     }
@@ -644,21 +649,28 @@ export default class DropTermExtension extends Extension {
         this._makeAboveSafe();
         Main.activateWindow(win);
 
-        // Re-pin once more on the next idle: the initial map can land centered
-        // before our move "sticks".
-        if (this._pinLaterId)
-            GLib.source_remove(this._pinLaterId);
-        this._pinLaterId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            this._pinLaterId = 0;
-            if (this._visible)
-                this._pin();
-            return GLib.SOURCE_REMOVE;
-        });
-        // Belt-and-suspenders: Mutter's centred initial placement can also land
-        // a few frames late on the first open, after the single idle re-pin
-        // above has already fired. Re-pin a handful of times over the first
-        // ~0.6s so a late placement still gets snapped back to the drop spot.
-        this._schedulePinBurst();
+        // Ras "window muncul di tengah" cuma terjadi pada open PERTAMA (sebelum
+        // window dikelola Mutter). Setelah itu window sudah ditempatkan, jadi
+        // idle re-pin + pin-burst hanya menyia-nyiakan kerja tiap toggle
+        // (4x GLib.timeout_add + move_resize_frame berulang). Jalankan hanya
+        // sekali; toggle berikutnya cukup _pin() langsung di atas.
+        if (!this._firstShown) {
+            // Re-pin once more on the next idle: the initial map can land centered
+            // before our move "sticks".
+            if (this._pinLaterId)
+                GLib.source_remove(this._pinLaterId);
+            this._pinLaterId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                this._pinLaterId = 0;
+                if (this._visible)
+                    this._pin();
+                return GLib.SOURCE_REMOVE;
+            });
+            // Belt-and-suspenders: Mutter's centred initial placement can also land
+            // a few frames late on the first open, after the single idle re-pin
+            // above has already fired. Re-pin a handful of times over the first
+            // ~0.6s so a late placement still gets snapped back to the drop spot.
+            this._schedulePinBurst();
+        }
 
         if (actor) {
             actor.remove_all_transitions();
@@ -670,6 +682,7 @@ export default class DropTermExtension extends Extension {
             });
         }
         this._visible = true;
+        this._firstShown = true;
     }
 
     // Hide = slide up and hide the actor. We deliberately do NOT minimize()

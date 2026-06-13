@@ -38,6 +38,25 @@ def _trim_to_newline(buf):
     return buf[nl + 1:] if 0 <= nl < len(buf) - 1 else buf
 
 
+def write_all(fd, data):
+    """Tulis SELURUH `data` ke `fd`. `os.write` pada sebuah tty bisa short-write
+    di bawah backpressure (output deras), jadi kita loop sampai habis — ini juga
+    memberi flow-control yang benar ke bash. Kembalikan True kalau sukses, False
+    kalau fd error (mis. sisi lain tertutup)."""
+    view = memoryview(data)
+    while view:
+        try:
+            n = os.write(fd, view)
+        except InterruptedError:
+            continue
+        except OSError:
+            return False
+        if n <= 0:
+            return False
+        view = view[n:]
+    return True
+
+
 def rotate():
     """Jaga ukuran log tetap terbatas; simpan ekor MAX_BYTES terakhir."""
     try:
@@ -49,6 +68,37 @@ def rotate():
                 f.write(_trim_to_newline(tail))
     except OSError:
         pass
+
+
+def rotate_live(logf):
+    """Pangkas log SELAMA sesi berjalan (rotate() hanya jalan sekali saat spawn,
+    padahal foot hidup berhari-hari → log bisa membengkak tanpa batas). Kalau
+    sudah > MAX_BYTES, tulis ekornya ke berkas sementara, os.replace ke atas LOG,
+    lalu buka ulang fd append. Kembalikan fd yang dipakai lanjut (baru bila
+    berhasil dipangkas, fd lama bila tidak)."""
+    try:
+        if os.path.getsize(LOG) <= MAX_BYTES:
+            return logf
+    except OSError:
+        return logf
+    try:
+        with open(LOG, "rb") as f:
+            f.seek(-MAX_BYTES, os.SEEK_END)
+            tail = _trim_to_newline(f.read())
+        tmp = LOG + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(tail)
+        os.replace(tmp, LOG)
+    except OSError:
+        return logf
+    try:
+        logf.close()
+    except OSError:
+        pass
+    try:
+        return open(LOG, "ab", buffering=0)
+    except OSError:
+        return None
 
 
 def read_replay():
@@ -88,10 +138,10 @@ def main():
             ts = datetime.datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
         except OSError:
             ts = "?"
-        os.write(1, banner("riwayat sesi sebelumnya (terakhir %s, dari disk)" % ts))
-        os.write(1, prev)
-        os.write(1, b"\x1b[0m")                 # reset atribut warna/format
-        os.write(1, banner("sesi baru"))
+        write_all(1, banner("riwayat sesi sebelumnya (terakhir %s, dari disk)" % ts))
+        write_all(1, prev)
+        write_all(1, b"\x1b[0m")                 # reset atribut warna/format
+        write_all(1, banner("sesi baru"))
 
     logf = open(LOG, "ab", buffering=0)
 
@@ -119,6 +169,7 @@ def main():
         except termios.error:
             old = None
 
+    written = 0                                 # byte sejak cek-pangkas terakhir
     watch = [0, master]
     try:
         while True:
@@ -140,9 +191,7 @@ def main():
                     # berhenti mengikuti stdin, habiskan output shell, lalu keluar.
                     watch = [master]
                 else:
-                    try:
-                        os.write(master, data)
-                    except OSError:
+                    if not write_all(master, data):
                         watch = [master]
             if master in rlist:
                 try:
@@ -151,21 +200,35 @@ def main():
                     data = b""
                 if not data:
                     break                       # shell keluar
-                try:
-                    os.write(1, data)
-                except OSError:
-                    pass
-                logf.write(data)
+                write_all(1, data)              # ke layar foot; abaikan kalau gagal
+                # Kegagalan menulis log TIDAK boleh mematikan terminal: kalau disk
+                # penuh / I/O error, hentikan logging diam-diam tapi tetap proxy
+                # supaya sesi tetap hidup.
+                if logf is not None:
+                    try:
+                        logf.write(data)
+                    except OSError:
+                        try:
+                            logf.close()
+                        except OSError:
+                            pass
+                        logf = None
+                    else:
+                        written += len(data)
+                        if written >= 1024 * 1024:   # cek pangkas tiap ~1MB
+                            written = 0
+                            logf = rotate_live(logf)
     finally:
         if old is not None:
             try:
                 termios.tcsetattr(0, termios.TCSAFLUSH, old)
             except termios.error:
                 pass
-        try:
-            logf.close()
-        except OSError:
-            pass
+        if logf is not None:
+            try:
+                logf.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
