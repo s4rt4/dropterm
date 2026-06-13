@@ -461,13 +461,20 @@ export default class DropTermExtension extends Extension {
             return;
         try {
             const cfg = GLib.build_filenamev([this.path, 'foot.ini']);
-            this._proc = Gio.Subprocess.new(
+            const proc = Gio.Subprocess.new(
                 ['foot', `--config=${cfg}`, `--app-id=${APP_ID}`, '--title=Drop Terminal'],
                 Gio.SubprocessFlags.NONE,
             );
+            this._proc = proc;
             // When foot exits (user types `exit`), forget it so a click respawns.
-            this._proc.wait_async(null, () => {
-                this._proc = null;
+            // Guard on identity: a restart/theme-switch kills the OLD proc and
+            // spawns a new one synchronously, but the old proc's wait_async fires
+            // LATER on the main loop — without this check it would null out the
+            // freshly-spawned proc, downgrading _killFoot()'s logout path from the
+            // synchronous force_exit to the racy async `kill -9 PID`.
+            proc.wait_async(null, () => {
+                if (this._proc === proc)
+                    this._proc = null;
             });
         } catch (e) {
             Main.notify('Drop Terminal', `Failed to launch foot: ${e.message}`);
