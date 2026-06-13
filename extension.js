@@ -22,6 +22,19 @@ const SM_IFACE = 'org.gnome.SessionManager';
 const SM_PATH = '/org/gnome/SessionManager';
 const SM_CLIENT_IFACE = 'org.gnome.SessionManager.ClientPrivate';
 
+// logind — a SECOND, independent kill trigger. The gnome-session hook above only
+// catches a logout/reboot started from INSIDE GNOME (the menu). A shutdown/reboot
+// started from OUTSIDE — `systemctl reboot`, a kernel update's auto-reboot, the
+// headline "boot a different kernel" case — goes through logind, which emits
+// PrepareForShutdown BEFORE the gnome-shell teardown in that path, so the
+// gnome-session signal may never arrive in time. We hold a `delay` inhibitor so
+// logind WAITS for us, SIGKILL foot on PrepareForShutdown(true), then release the
+// lock so we never hold the shutdown up. The two hooks cover different initiation
+// paths, so a regression in either still leaves foot protected by the other.
+const LOGIN_BUS_NAME = 'org.freedesktop.login1';
+const LOGIN_PATH = '/org/freedesktop/login1';
+const LOGIN_MANAGER_IFACE = 'org.freedesktop.login1.Manager';
+
 // Visual tuning.
 const DROP_HEIGHT_RATIO = 0.45;   // fraction of screen height the terminal covers
 const SLIDE_IN_MS = 180;
@@ -201,6 +214,8 @@ export default class DropTermExtension extends Extension {
         this._firstShown = false;  // sudah pernah tampil sukses? (lihat _show)
         this._clientPath = null;
         this._endSessionSubId = 0;
+        this._shutdownInhibitorFd = -1;   // logind delay-inhibitor fd (-1 = none)
+        this._prepareShutdownSubId = 0;
 
         // Make sure the colour-scheme file foot includes exists before we ever
         // spawn foot, otherwise the include= line errors out on a fresh setup.
@@ -216,6 +231,17 @@ export default class DropTermExtension extends Extension {
 
         // Register with gnome-session so we get a chance to kill foot at logout.
         this._registerSession();
+
+        // Independent backup trigger for shutdowns/reboots started outside GNOME.
+        this._registerShutdownInhibitor();
+
+        // If BOTH protections failed to arm, a live foot could survive into the
+        // shell's teardown and crash the whole session — surface that instead of
+        // failing silently.
+        if (!this._clientPath && this._shutdownInhibitorFd < 0) {
+            Main.notify('Drop Terminal',
+                'Logout-crash protection could not arm (gnome-session + logind both failed).');
+        }
 
         // If foot was already running (e.g. after a lock/unlock that disabled us),
         // re-adopt its window instead of spawning a second one.
@@ -241,6 +267,7 @@ export default class DropTermExtension extends Extension {
         this._clearPinBurst();
         this._disconnectWindow();
         this._unregisterSession();
+        this._unregisterShutdownInhibitor();
 
         // Kill foot rather than leaking it. A long-lived, sticky, always-above
         // foreign Wayland window left alive into the shell's shutdown gets
@@ -278,7 +305,15 @@ export default class DropTermExtension extends Extension {
             // graceful close and survived into shell teardown.
             const pid = this._win.get_pid();
             if (pid > 0) {
-                try { GLib.spawn_command_line_async(`kill -9 ${pid}`); } catch (_e) {}
+                // SYNCHRONOUS SIGKILL (not spawn_command_line_async): at logout an
+                // async kill can lose the race against the shell teardown — the
+                // very crash we are guarding against. spawn_sync blocks until
+                // kill(1) has signalled, so foot's Wayland client is already gone
+                // when we return.
+                try {
+                    GLib.spawn_sync(null, ['kill', '-9', String(pid)], null,
+                        GLib.SpawnFlags.SEARCH_PATH, null);
+                } catch (_e) {}
             }
         }
         this._win = null;
@@ -351,6 +386,73 @@ export default class DropTermExtension extends Extension {
             } catch (_e) {}
             this._clientPath = null;
         }
+    }
+
+    // ---- logind shutdown inhibitor (independent logout hook) --------------
+
+    // Grab a fresh `delay` inhibitor fd from logind. Holding it makes logind
+    // wait for us (up to InhibitDelayMaxSec, ~5s) at PrepareForShutdown so we get
+    // a guaranteed window to kill foot before the session tears down.
+    _takeShutdownInhibitorLock() {
+        try {
+            const [reply, fdList] = Gio.DBus.system.call_with_unix_fd_list_sync(
+                LOGIN_BUS_NAME, LOGIN_PATH, LOGIN_MANAGER_IFACE, 'Inhibit',
+                new GLib.Variant('(ssss)', [
+                    'shutdown',
+                    'Drop Terminal',
+                    'Kill foot before the Wayland session tears down',
+                    'delay',
+                ]),
+                new GLib.VariantType('(h)'),
+                Gio.DBusCallFlags.NONE, -1, null, null);
+            this._shutdownInhibitorFd = fdList.get(reply.deepUnpack()[0]);
+        } catch (e) {
+            console.log(`[DropTerm] shutdown inhibitor lock failed: ${e.message}`);
+            this._shutdownInhibitorFd = -1;
+        }
+    }
+
+    _registerShutdownInhibitor() {
+        this._takeShutdownInhibitorLock();
+        try {
+            this._prepareShutdownSubId = Gio.DBus.system.signal_subscribe(
+                LOGIN_BUS_NAME, LOGIN_MANAGER_IFACE, 'PrepareForShutdown',
+                LOGIN_PATH, null, Gio.DBusSignalFlags.NONE,
+                (_c, _s, _p, _i, _sig, params) =>
+                    this._onPrepareForShutdown(params.deepUnpack()[0]));
+            if (this._shutdownInhibitorFd >= 0)
+                console.log('[DropTerm] shutdown inhibitor armed');
+        } catch (e) {
+            console.log(`[DropTerm] PrepareForShutdown subscribe failed: ${e.message}`);
+        }
+    }
+
+    _onPrepareForShutdown(starting) {
+        console.log(`[DropTerm] PrepareForShutdown: ${starting}`);
+        if (starting) {
+            // Shutdown/reboot is beginning. Kill foot now, then release our delay
+            // lock immediately so we add no perceptible delay to the shutdown.
+            this._killFoot();
+            this._releaseShutdownInhibitor();
+        } else if (this._shutdownInhibitorFd < 0) {
+            // A pending shutdown was cancelled — re-arm so we stay protected.
+            this._takeShutdownInhibitorLock();
+        }
+    }
+
+    _releaseShutdownInhibitor() {
+        if (this._shutdownInhibitorFd >= 0) {
+            try { GLib.close(this._shutdownInhibitorFd); } catch (_e) {}
+            this._shutdownInhibitorFd = -1;
+        }
+    }
+
+    _unregisterShutdownInhibitor() {
+        if (this._prepareShutdownSubId) {
+            Gio.DBus.system.signal_unsubscribe(this._prepareShutdownSubId);
+            this._prepareShutdownSubId = 0;
+        }
+        this._releaseShutdownInhibitor();
     }
 
     // ---- public actions wired to the panel button ------------------------
